@@ -1,7 +1,7 @@
 /**
- * DeepSeek Cache Optimization Extension
+ * Prefix Cache Optimization Extension
  *
- * Multi-layered prefix cache optimization for DeepSeek models in pi:
+ * Multi-layered prefix cache optimization for registered model families in pi:
  *
  *   P0 — Date/CWD freeze: replaces dynamic system prompt elements with
  *        frozen values captured at session start. This is the root-cause fix
@@ -29,9 +29,10 @@
  *        cheapest cache-capable upstream and pins it via the `provider`
  *        routing object (order + allow_fallbacks:false).
  *
- * Works with any provider serving DeepSeek models — detected by model ID
- * prefix (deepseek-*) or provider name (deepseek). No provider names are
- * hardcoded. Non-DeepSeek models pass through unchanged.
+ * Works with any provider serving a registered cache family — today DeepSeek
+ * and Xiaomi MiMo. Detection, pricing, plan credits, and the summarizer model
+ * all come from the registry in lib/families.ts. Unregistered models pass
+ * through unchanged.
  *
  * Install: pi install npm:@rohaquinlop/pi-deepseek-cache
  */
@@ -64,7 +65,6 @@ import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
-  isDeepSeekModel,
   todayISO,
   calcHitRate,
   estimateSavings,
@@ -79,7 +79,21 @@ import {
   mergePinLookupResult,
   type OpenRouterEndpoint,
   type PinCacheEntry,
+  type PricingTier,
 } from "../lib/helpers.js";
+import {
+  FALLBACK_PRICING,
+  aggregateSavings,
+  estimateCreditSavings,
+  formatCredits,
+  isCacheOptimizedModel,
+  resolveCreditTier,
+  resolveDisplayUnit,
+  resolveOpenRouterVendor,
+  resolvePricingTier,
+  resolveSummarizerCandidates,
+  type CreditTier,
+} from "../lib/families.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -109,8 +123,23 @@ interface PersistedStats {
   input: number;
   cacheWrite: number;
   turns: number;
+  /** Model and provider of the session, for correct multi-model aggregates. */
+  modelId?: string;
+  provider?: string;
   /** P5: set once auto-pin injection has occurred this session. */
   openrouterPinned?: boolean;
+}
+
+type AggregateStats = PersistedStats & {
+  sessionCount: number;
+  savedUsd: number;
+  savedCredits: number;
+};
+
+interface DisplayContext {
+  pricing: PricingTier;
+  creditTier?: CreditTier;
+  unit: "usd" | "credits";
 }
 
 interface HistoryPoint {
@@ -136,9 +165,10 @@ const inflightLookups = new Map<string, Promise<void>>();
 
 async function fetchPinnedUpstream(
   modelId: string,
+  vendor: string,
 ): Promise<string | undefined> {
   try {
-    const res = await fetch(openRouterEndpointsUrl(modelId), {
+    const res = await fetch(openRouterEndpointsUrl(modelId, vendor), {
       headers: { Accept: "application/json" },
       signal: AbortSignal.timeout(PIN_LOOKUP_TIMEOUT_MS),
     });
@@ -165,12 +195,12 @@ async function fetchPinnedUpstream(
  * expired entries keep serving until the refresh lands. A failed refresh
  * keeps any previously detected upstream but degrades to the short retry TTL.
  */
-function ensurePinnedUpstream(modelId: string): string | undefined {
+function ensurePinnedUpstream(modelId: string, vendor: string): string | undefined {
   const entry = pinCache.get(modelId);
   if (pinEntryFresh(entry, Date.now())) return entry!.slug;
 
   if (!inflightLookups.has(modelId)) {
-    const lookup = fetchPinnedUpstream(modelId)
+    const lookup = fetchPinnedUpstream(modelId, vendor)
       .then((slug) => {
         pinCache.set(modelId, mergePinLookupResult(entry, slug, Date.now()));
       })
@@ -281,53 +311,18 @@ function maybeCleanupOldSessions(): void {
   }
 }
 
-/**
- * Read all stats-*.json files in STATS_DIR and return summed PersistedStats
- * plus the count of sessions.
- */
-function aggregateAllSessions(): PersistedStats & { sessionCount: number } {
+async function aggregateAllSessionsAsync(): Promise<AggregateStats> {
   const agg: PersistedStats = {
     cacheRead: 0,
     input: 0,
     cacheWrite: 0,
     turns: 0,
   };
-  let sessionCount = 0;
+  let sessions: PersistedStats[] = [];
   try {
-    if (!existsSync(STATS_DIR)) return { ...agg, sessionCount: 0 };
-    const files = readdirSync(STATS_DIR);
-    for (const file of files) {
-      if (file.startsWith("stats-") && file.endsWith(".json")) {
-        try {
-          const data: PersistedStats = JSON.parse(
-            readFileSync(join(STATS_DIR, file), "utf-8"),
-          );
-          agg.cacheRead += data.cacheRead ?? 0;
-          agg.input += data.input ?? 0;
-          agg.cacheWrite += data.cacheWrite ?? 0;
-          agg.turns += data.turns ?? 0;
-          sessionCount++;
-        } catch {
-          // skip corrupted files
-        }
-      }
+    if (!existsSync(STATS_DIR)) {
+      return { ...agg, sessionCount: 0, savedUsd: 0, savedCredits: 0 };
     }
-  } catch {
-    // best-effort
-  }
-  return { ...agg, sessionCount };
-}
-
-async function aggregateAllSessionsAsync(): Promise<PersistedStats & { sessionCount: number }> {
-  const agg: PersistedStats = {
-    cacheRead: 0,
-    input: 0,
-    cacheWrite: 0,
-    turns: 0,
-  };
-  let sessionCount = 0;
-  try {
-    if (!existsSync(STATS_DIR)) return { ...agg, sessionCount: 0 };
     const files = readdirSync(STATS_DIR); // directory listing is fast — sync is fine
 
     const statsFiles = files.filter(f => f.startsWith("stats-") && f.endsWith(".json"));
@@ -343,19 +338,24 @@ async function aggregateAllSessionsAsync(): Promise<PersistedStats & { sessionCo
       })
     );
 
-    const valid = results.filter((r): r is PersistedStats => r !== null);
+    sessions = results.filter((r): r is PersistedStats => r !== null);
 
-    for (const data of valid) {
+    for (const data of sessions) {
       agg.cacheRead += data.cacheRead ?? 0;
       agg.input += data.input ?? 0;
       agg.cacheWrite += data.cacheWrite ?? 0;
       agg.turns += data.turns ?? 0;
-      sessionCount++;
     }
   } catch {
     // best-effort
   }
-  return { ...agg, sessionCount };
+  const { savedUsd, savedCredits } = aggregateSavings(sessions);
+  return {
+    ...agg,
+    sessionCount: sessions.length,
+    savedUsd,
+    savedCredits,
+  };
 }
 
 function scheduleSaveStats(s: PersistedStats, sid: string) {
@@ -449,20 +449,20 @@ class CacheStatsOverlay implements Focusable {
   readonly width = 58;
   focused = false;
   private stats: PersistedStats;
-  private aggregate?: PersistedStats & { sessionCount: number };
+  private aggregate?: AggregateStats;
   private prefixBreaks = 0;
   private theme: any;
   private done: () => void;
-  private modelId?: string;
+  private display: DisplayContext;
   private pin?: { upstream?: string; userOverride: boolean };
 
   constructor(
     theme: any,
     stats: PersistedStats,
     done: () => void,
-    aggregate?: PersistedStats & { sessionCount: number },
+    aggregate?: AggregateStats,
     prefixBreaks?: number,
-    modelId?: string,
+    display?: DisplayContext,
     pin?: { upstream?: string; userOverride: boolean },
   ) {
     this.theme = theme;
@@ -470,7 +470,7 @@ class CacheStatsOverlay implements Focusable {
     this.done = done;
     this.aggregate = aggregate;
     if (prefixBreaks !== undefined) this.prefixBreaks = prefixBreaks;
-    if (modelId !== undefined) this.modelId = modelId;
+    this.display = display ?? { pricing: FALLBACK_PRICING, unit: "usd" };
     if (pin !== undefined) this.pin = pin;
   }
 
@@ -478,17 +478,44 @@ class CacheStatsOverlay implements Focusable {
     if (matchesKey(data, "escape") || matchesKey(data, "return")) this.done();
   }
 
+  private formatUsd(saved: number): string {
+    if (saved <= 0) return "$0.00";
+    return saved >= 0.01 ? `$${saved.toFixed(2)}` : "< $0.01";
+  }
+
+  private sessionSavings(s: PersistedStats): string | null {
+    const { unit, creditTier, pricing } = this.display;
+    if (unit === "credits") {
+      if (!creditTier) return null;
+      return formatCredits(estimateCreditSavings(s.cacheRead, creditTier));
+    }
+    const { saved } = estimateSavings(s.cacheRead, s.input, 0, pricing);
+    return this.formatUsd(saved);
+  }
+
+  private aggregateSavingsText(): string | null {
+    const agg = this.aggregate;
+    if (!agg) return null;
+    const parts: string[] = [];
+    if (agg.savedUsd > 0 || agg.savedCredits <= 0) {
+      parts.push(this.formatUsd(agg.savedUsd));
+    }
+    if (agg.savedCredits > 0) parts.push(formatCredits(agg.savedCredits));
+    return parts.join(" + ");
+  }
+
   private sectionBlock(
     title: string,
     s: PersistedStats,
     turnsLabel?: string,
+    savingsText?: string | null,
   ): string[] {
     const th = this.theme;
     const inner = this.width - 2;
     const { cacheRead, input, cacheWrite, turns } = s;
     const hitRate = calcHitRate(cacheRead, input, cacheWrite).toFixed(1);
-    const { saved } = estimateSavings(cacheRead, input, 0, this.modelId);
-    const savedStr = saved >= 0.01 ? `$${saved.toFixed(2)}` : "< $0.01";
+    const savings =
+      savingsText === undefined ? this.sessionSavings(s) : savingsText;
     const pad = (s: string) =>
       s + " ".repeat(Math.max(0, inner - visibleWidth(s)));
     const row = (s: string) =>
@@ -514,8 +541,11 @@ class CacheStatsOverlay implements Focusable {
     rows.push(
       row(label("Cache misses", `${input.toLocaleString()} tokens`)),
       row(label("Turns", turnStr)),
-      row(label("Est. savings", `${th.fg("accent", savedStr)}`)),
     );
+
+    if (savings !== null) {
+      rows.push(row(label("Est. savings", `${th.fg("accent", savings)}`)));
+    }
 
     return rows;
   }
@@ -550,6 +580,7 @@ class CacheStatsOverlay implements Focusable {
             turns: this.aggregate.turns,
           },
           `${this.aggregate.turns}`,
+          this.aggregateSavingsText(),
         ),
       );
     }
@@ -774,7 +805,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event, ctx) => {
     setCtx(ctx);
-    if (!isDeepSeekModel(ctx.model)) return;
+    if (!isCacheOptimizedModel(ctx.model)) return;
 
     let prompt = event.systemPrompt;
     let changed = false;
@@ -806,7 +837,14 @@ export default function (pi: ExtensionAPI) {
     cacheWrite += u.cacheWrite ?? 0;
     turns += 1;
 
-    const stats: PersistedStats = { cacheRead, input, cacheWrite, turns };
+    const stats: PersistedStats = {
+      cacheRead,
+      input,
+      cacheWrite,
+      turns,
+      modelId: ctx.model?.id,
+      provider: ctx.model?.provider,
+    };
     if (openrouterPinnedThisSession) stats.openrouterPinned = true;
     scheduleSaveStats(stats, sessionId);
 
@@ -853,7 +891,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_provider_request", (event, ctx) => {
     setCtx(ctx);
-    if (!isDeepSeekModel(ctx.model)) return;
+    if (!isCacheOptimizedModel(ctx.model)) return;
 
     const payload = event.payload as {
       messages?: CachedMessage[];
@@ -869,7 +907,10 @@ export default function (pi: ExtensionAPI) {
       if (payload.provider !== undefined && payload.provider !== null) {
         openrouterUserOverride = true;
       } else {
-        const upstream = ensurePinnedUpstream(ctx.model.id);
+        const vendor = resolveOpenRouterVendor(ctx.model);
+        const upstream = vendor
+          ? ensurePinnedUpstream(ctx.model.id, vendor)
+          : undefined;
         const pin = computeProviderPin(payload.provider, upstream);
         if (pin) {
           payload.provider = pin;
@@ -911,8 +952,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_compact", async (event, ctx) => {
     setCtx(ctx);
 
-    // Only intercept if we're on a DeepSeek model
-    if (!isDeepSeekModel(ctx.model)) return;
+    // Only intercept for models from a registered cache family
+    if (!isCacheOptimizedModel(ctx.model)) return;
 
     const { preparation, signal } = event;
     if (!preparation) return; // fall back to default compaction
@@ -925,11 +966,23 @@ export default function (pi: ExtensionAPI) {
       ? `[Previous summary]\n${previousSummary}\n\n[New history]\n${history}`
       : history;
 
-    const key = createHash("sha256").update(text).digest("hex");
+    const model = resolveSummarizerModel(ctx);
+    if (!model) {
+      ctx.ui.notify(
+        "deepseek-cache: no summarizer model found, falling back to default compaction",
+        "warning",
+      );
+      return;
+    }
+
+    // Key by summarizer model so a MiMo session never replays a DeepSeek summary.
+    const key = createHash("sha256")
+      .update(`${model.id}\n${text}`)
+      .digest("hex");
     let summary = summaryCache.get(key);
 
     if (!summary) {
-      summary = await summarizeWithFlash(text, ctx, signal);
+      summary = await summarizeWithModel(model, text, ctx, signal);
       if (!summary) return; // fall back to default compaction
       summaryCache.set(key, summary);
       evictSummaryCacheIfNeeded(summaryCache);
@@ -941,7 +994,7 @@ export default function (pi: ExtensionAPI) {
         summary,
         firstKeptEntryId,
         tokensBefore,
-        details: { summarizer: "deepseek-v4-flash" },
+        details: { summarizer: model.id },
       },
     };
   });
@@ -951,10 +1004,17 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════════════════════════════════════
 
   pi.registerCommand("cache-stats", {
-    description: "DeepSeek cache hit rate statistics",
+    description: "Cache hit rate statistics",
     handler: async (_args, ctx) => {
       setCtx(ctx);
       const agg = await aggregateAllSessionsAsync();
+      const model = ctx.model;
+      const vendor = resolveOpenRouterVendor(model);
+      const display: DisplayContext = {
+        pricing: resolvePricingTier(model),
+        creditTier: resolveCreditTier(model?.id),
+        unit: resolveDisplayUnit(model?.provider),
+      };
       await ctx.ui.custom(
         (_tui, theme, _kb, done) =>
           new CacheStatsOverlay(
@@ -963,10 +1023,13 @@ export default function (pi: ExtensionAPI) {
             done,
             agg,
             prefixBreaks,
-            ctx.model?.id,
-            ctx.model?.provider === "openrouter"
+            display,
+            model?.provider === "openrouter"
               ? {
-                  upstream: ensurePinnedUpstream(ctx.model.id),
+                  upstream:
+                    model && vendor
+                      ? ensurePinnedUpstream(model.id, vendor)
+                      : undefined,
                   userOverride: openrouterUserOverride,
                 }
               : undefined,
@@ -977,7 +1040,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cache-graph", {
-    description: "DeepSeek cache hit rate trend chart",
+    description: "Cache hit rate trend chart",
     handler: async (_args, ctx) => {
       setCtx(ctx);
       await ctx.ui.custom(
@@ -989,7 +1052,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("cache-reset", {
-    description: "Reset DeepSeek cache statistics",
+    description: "Reset cache statistics",
     handler: async (_args, ctx) => {
       setCtx(ctx);
       // Reset in-memory counters
@@ -1046,42 +1109,45 @@ export default function (pi: ExtensionAPI) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// P3 helper: summarize with deepseek-v4-flash at temperature 0
+// P3 helper: family summarizer at temperature 0
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function summarizeWithFlash(
+/**
+ * Resolve the summarizer model for the active family. Preference order:
+ * each candidate on the active provider, each candidate on any provider,
+ * then the active model itself.
+ */
+function resolveSummarizerModel(ctx: ExtensionContext) {
+  const candidates = resolveSummarizerCandidates(ctx.model);
+  const activeProvider = ctx.model?.provider;
+
+  if (activeProvider) {
+    for (const candidate of candidates) {
+      const found = ctx.modelRegistry.find(activeProvider, candidate);
+      if (found) return found;
+    }
+  }
+
+  for (const candidate of candidates) {
+    for (const provider of ctx.modelRegistry.listProviders()) {
+      const found = ctx.modelRegistry.find(provider, candidate);
+      if (found) return found;
+    }
+  }
+
+  return ctx.model;
+}
+
+async function summarizeWithModel(
+  model: NonNullable<ExtensionContext["model"]>,
   text: string,
   ctx: ExtensionContext,
   signal: AbortSignal,
 ): Promise<string | undefined> {
-  // Use the active model's provider — it already serves DeepSeek models.
-  // No hardcoded provider names. Works for NaN Builders, OpenRouter,
-  // direct DeepSeek API, and custom providers.
-  const currentProvider = ctx.model?.provider;
-  let model = currentProvider
-    ? ctx.modelRegistry.find(currentProvider, "deepseek-v4-flash")
-    : undefined;
-
-  // Last resort: search any provider
-  if (!model) {
-    for (const prov of ctx.modelRegistry.listProviders()) {
-      model = ctx.modelRegistry.find(prov, "deepseek-v4-flash");
-      if (model) break;
-    }
-  }
-
-  if (!model) {
-    ctx.ui.notify(
-      "deepseek-cache: flash model not found, skipping cache-friendly compaction",
-      "warning",
-    );
-    return;
-  }
-
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
     ctx.ui.notify(
-      "deepseek-cache: flash auth failed, falling back to default compaction",
+      "deepseek-cache: summarizer auth failed, falling back to default compaction",
       "warning",
     );
     return;
@@ -1127,7 +1193,7 @@ async function summarizeWithFlash(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     ctx.ui.notify(
-      `deepseek-cache: flash summarization failed (${msg}), falling back to default compaction`,
+      `deepseek-cache: summarization failed (${msg}), falling back to default compaction`,
       "error",
     );
     return;

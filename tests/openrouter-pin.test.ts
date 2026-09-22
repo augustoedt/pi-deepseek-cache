@@ -17,9 +17,11 @@ import {
 const ep = (
   tag: string,
   cacheRead: string | null | undefined,
+  status?: number,
 ): OpenRouterEndpoint => ({
   provider_name: tag.split("/")[0],
   tag,
+  status,
   pricing: { input_cache_read: cacheRead as string | null },
 });
 
@@ -55,6 +57,24 @@ describe("pickCacheCapableUpstream", () => {
     const endpoints = [ep("zeta/fp8", "0.0000001"), ep("alpha/fp8", "0.0000001")];
     expect(pickCacheCapableUpstream(endpoints)).toBe("alpha");
   });
+
+  it("prefers an active endpoint over a cheaper inactive one", () => {
+    const endpoints = [
+      ep("cheap-dead/fp8", "0.000000001", -2),
+      ep("active/fp8", "0.000000002", 0),
+    ];
+    expect(pickCacheCapableUpstream(endpoints)).toBe("active");
+  });
+
+  it("falls back to all cache-capable endpoints when none is active", () => {
+    const endpoints = [ep("a/fp8", "0.000000001", -2), ep("b/fp8", "0.000000002", -1)];
+    expect(pickCacheCapableUpstream(endpoints)).toBe("a");
+  });
+
+  it("keeps working when the status field is absent", () => {
+    const endpoints = [ep("a/fp8", "0.000000001"), ep("b/fp8", "0.000000002")];
+    expect(pickCacheCapableUpstream(endpoints)).toBe("a");
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -62,15 +82,21 @@ describe("pickCacheCapableUpstream", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("openRouterEndpointsUrl", () => {
-  it("prefixes bare model ids with the deepseek vendor namespace", () => {
-    expect(openRouterEndpointsUrl("deepseek-v4-flash")).toBe(
+  it("prefixes bare model ids with the family vendor namespace", () => {
+    expect(openRouterEndpointsUrl("deepseek-v4-flash", "deepseek")).toBe(
       "https://openrouter.ai/api/v1/models/deepseek/deepseek-v4-flash/endpoints",
+    );
+    expect(openRouterEndpointsUrl("mimo-v2.6-flash", "xiaomi")).toBe(
+      "https://openrouter.ai/api/v1/models/xiaomi/mimo-v2.6-flash/endpoints",
     );
   });
 
   it("keeps full slugs as-is", () => {
-    expect(openRouterEndpointsUrl("deepseek/deepseek-v4-pro")).toBe(
+    expect(openRouterEndpointsUrl("deepseek/deepseek-v4-pro", "deepseek")).toBe(
       "https://openrouter.ai/api/v1/models/deepseek/deepseek-v4-pro/endpoints",
+    );
+    expect(openRouterEndpointsUrl("xiaomi/mimo-v2.6-pro", "xiaomi")).toBe(
+      "https://openrouter.ai/api/v1/models/xiaomi/mimo-v2.6-pro/endpoints",
     );
   });
 });

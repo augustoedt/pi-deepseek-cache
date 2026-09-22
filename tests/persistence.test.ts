@@ -16,6 +16,8 @@ interface PersistedStats {
   input: number;
   cacheWrite: number;
   turns: number;
+  modelId?: string;
+  provider?: string;
 }
 
 interface HistoryPoint {
@@ -150,6 +152,35 @@ describe("stats persistence", () => {
     saveStats(file, stats);
     const loaded = loadStats(file);
     expect(loaded).toEqual(stats);
+  });
+
+  it("round-trips modelId and provider", () => {
+    const file = join(testDir, "stats.json");
+    const stats: PersistedStats = {
+      cacheRead: 1000,
+      input: 500,
+      cacheWrite: 0,
+      turns: 3,
+      modelId: "mimo-v2.6-flash",
+      provider: "xiaomi-token-plan-sgp",
+    };
+    saveStats(file, stats);
+    const loaded = loadStats(file);
+    expect(loaded.modelId).toBe("mimo-v2.6-flash");
+    expect(loaded.provider).toBe("xiaomi-token-plan-sgp");
+  });
+
+  it("loads a legacy file without modelId or provider", () => {
+    const file = join(testDir, "stats.json");
+    // Shape written by extension versions before MiMo support.
+    writeFileSync(
+      file,
+      JSON.stringify({ cacheRead: 200, input: 100, cacheWrite: 0, turns: 2 }, null, 2),
+    );
+    const loaded = loadStats(file);
+    expect(loaded.modelId).toBeUndefined();
+    expect(loaded.provider).toBeUndefined();
+    expect(loaded.cacheRead).toBe(200);
   });
 });
 
@@ -322,6 +353,8 @@ describe("async aggregation", () => {
       cacheWrite: number;
       turns: number;
       sessionCount: number;
+      savedUsd: number;
+      savedCredits: number;
     }
 
     const mockResults: AggregatedStats = {
@@ -330,6 +363,8 @@ describe("async aggregation", () => {
       cacheWrite: 100,
       turns: 10,
       sessionCount: 2,
+      savedUsd: 0.42,
+      savedCredits: 0,
     };
 
     // Verify the shape matches what CacheStatsOverlay expects
@@ -338,5 +373,7 @@ describe("async aggregation", () => {
     expect(mockResults).toHaveProperty("cacheWrite");
     expect(mockResults).toHaveProperty("turns");
     expect(mockResults).toHaveProperty("sessionCount");
+    expect(mockResults).toHaveProperty("savedUsd");
+    expect(mockResults).toHaveProperty("savedCredits");
   });
 });

@@ -12,7 +12,17 @@
   "files": ["extensions/", "lib/", "README.md"],
   "pi": {
     "extensions": ["./extensions/index.ts"],
-    "appliesToModels": ["deepseek-*", "deepseek"]
+    "appliesToModels": [
+      "deepseek-*",
+      "deepseek",
+      "*/deepseek-*",
+      "mimo-*",
+      "*/mimo-*",
+      "xiaomi",
+      "xiaomi-token-plan-ams",
+      "xiaomi-token-plan-cn",
+      "xiaomi-token-plan-sgp"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

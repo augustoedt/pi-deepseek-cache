@@ -2,24 +2,13 @@
  * Pure helpers for the deepseek-cache extension.
  * Extracted for testability — no pi runtime dependencies.
  *
- * Used by the extension: isDeepSeekModel, todayISO, DATE_LINE_RE, CWD_LINE_RE,
- * calcHitRate, estimateSavings, isDateFrozen, isCwdFrozen, applyDateFreeze, applyCwdFreeze.
- * The remaining exports (frozenDate, frozenCwd) are used internally by the freeze helpers.
+ * Used by the extension: PricingTier, todayISO, DATE_LINE_RE, CWD_LINE_RE,
+ * calcHitRate, estimateSavings, isDateFrozen, isCwdFrozen, applyDateFreeze,
+ * applyCwdFreeze, and the OpenRouter pin helpers.
+ *
+ * Model-family detection, per-family pricing, and plan credits live in
+ * `families.ts`. This module stays family-agnostic.
  */
-
-/**
- * Check whether the current model looks like a DeepSeek variant.
- */
-export function isDeepSeekModel(model: { id: string; provider: string } | undefined): boolean {
-  if (!model) return false;
-  // Match by model ID prefix — the most reliable, provider-agnostic signal.
-  // Works for NaN Builders, OpenRouter, direct DeepSeek API, and custom providers.
-  if (model.id.toLowerCase().startsWith("deepseek-")) return true;
-  // Match by provider name — direct DeepSeek API, covers edge cases where
-  // model IDs don't use the deepseek- prefix.
-  if (model.provider === "deepseek") return true;
-  return false;
-}
 
 /**
  * Get today's date as YYYY-MM-DD.
@@ -41,37 +30,14 @@ export function calcHitRate(cacheRead: number, input: number, cacheWrite: number
   return denom > 0 ? (cacheRead / denom) * 100 : 0;
 }
 
-// ─── Pricing (moved from function-local constants) ──────────────────
-// Architectural change: these were previously local to estimateSavings().
-// Now module-level for testability and consistent access.
-// Last verified: 2026-06-22 — source: https://api-docs.deepseek.com/quick_start/pricing
+// ─── Pricing types ──────────────────────────────
+// Per-family pricing data lives in `families.ts`. The cost math here takes an
+// explicit tier, so it stays family-agnostic and directly testable.
 
 export interface PricingTier {
   cacheHitPerM: number;   // $ per 1M tokens
   cacheMissPerM: number;  // $ per 1M tokens
   outputPerM: number;     // $ per 1M tokens
-}
-
-export const PRICING_TIERS: Record<string, PricingTier> = {
-  "deepseek-v4-flash": {
-    cacheHitPerM: 0.0028,
-    cacheMissPerM: 0.14,
-    outputPerM: 0.28,
-  },
-  "deepseek-v4-pro": {
-    cacheHitPerM: 0.003625,
-    cacheMissPerM: 0.435,
-    outputPerM: 0.87,
-  },
-};
-
-export const FALLBACK_PRICING = PRICING_TIERS["deepseek-v4-flash"];
-
-export function getPricingTier(modelId?: string): PricingTier {
-  if (!modelId) return FALLBACK_PRICING;
-  // Use startsWith to avoid false positives (e.g., "deepseek-v4-flash-lite" should not match v4-flash).
-  const key = Object.keys(PRICING_TIERS).find(k => modelId.startsWith(k));
-  return key ? PRICING_TIERS[key] : FALLBACK_PRICING;
 }
 
 /**
@@ -82,10 +48,8 @@ export function estimateSavings(
   cacheRead: number,
   input: number = 0,
   output: number = 0,
-  modelId?: string
+  pricing: PricingTier
 ): { saved: number; hitRate: number; effectiveCost: number; withoutCacheCost: number } {
-  const pricing = getPricingTier(modelId);
-
   // Cost WITH caching: cache hits at discounted rate, cache misses at full rate
   const cacheHitCost  = (cacheRead * pricing.cacheHitPerM) / 1_000_000;
   const cacheMissCost = (input * pricing.cacheMissPerM) / 1_000_000;
@@ -179,7 +143,10 @@ export interface ProviderPin {
 /**
  * Pick the pin target from an endpoints list: the cheapest endpoint whose
  * pricing declares input_cache_read (i.e. the upstream supports prefix
- * caching). Ties broken by provider name for determinism.
+ * caching). Endpoints OpenRouter reports as active (status 0) are preferred;
+ * when none are active the full cache-capable list is used, which keeps the
+ * picker working when the status field is missing or unknown.
+ * Ties broken by provider name for determinism.
  * Returns undefined when no cache-capable endpoint exists.
  */
 export function pickCacheCapableUpstream(
@@ -190,8 +157,10 @@ export function pickCacheCapableUpstream(
     if (raw === null || raw === undefined) return false;
     return Number.isFinite(Number(raw));
   });
-  if (cacheable.length === 0) return undefined;
-  const sorted = [...cacheable].sort((a, b) => {
+  const active = cacheable.filter((e) => e.status === 0);
+  const pool = active.length > 0 ? active : cacheable;
+  if (pool.length === 0) return undefined;
+  const sorted = [...pool].sort((a, b) => {
     const diff =
       Number(a.pricing?.input_cache_read) - Number(b.pricing?.input_cache_read);
     if (diff !== 0) return diff;
@@ -204,11 +173,11 @@ export function pickCacheCapableUpstream(
 /**
  * Build the OpenRouter endpoints API URL for a model id.
  * Accepts both bare ids ("deepseek-v4-flash") and full slugs
- * ("deepseek/deepseek-v4-flash"); bare ids are assumed to live in the
- * deepseek vendor namespace on OpenRouter.
+ * ("deepseek/deepseek-v4-flash"); bare ids are prefixed with the vendor
+ * namespace of the matched family.
  */
-export function openRouterEndpointsUrl(modelId: string): string {
-  const slug = modelId.includes("/") ? modelId : `deepseek/${modelId}`;
+export function openRouterEndpointsUrl(modelId: string, vendor: string): string {
+  const slug = modelId.includes("/") ? modelId : `${vendor}/${modelId}`;
   return `https://openrouter.ai/api/v1/models/${slug}/endpoints`;
 }
 
