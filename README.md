@@ -1,6 +1,6 @@
 # pi-deepseek-cache
 
-**Reduce DeepSeek API costs by 95%+** through multi-layered prefix cache optimization. Zero configuration — auto-detects DeepSeek models and applies best practices transparently.
+**Cut prefix-cache API costs by 95%+** through multi-layered prefix cache optimization. Zero configuration — auto-detects supported model families (DeepSeek and Xiaomi MiMo) and applies best practices transparently.
 
 ## Contents
 
@@ -33,10 +33,18 @@ Pi's default system prompt embeds `Current date: YYYY-MM-DD` and `Current workin
 
 ## Cost Impact
 
-| | Without Extension | With Extension |
-|---|---|---|
-| **deepseek-v4-flash** input | $0.14/M tokens | $0.003/M tokens (98% less) |
-| **deepseek-v4-pro** input | $3.00/M tokens | $0.025/M tokens (99% less) |
+Input tokens, per million:
+
+| Model | Cache miss | Cache hit | Reduction |
+|-------|-----------|-----------|-----------|
+| **deepseek-v4-flash** | $0.14 | $0.0028 | 98% |
+| **deepseek-v4-pro** | $0.435 | $0.003625 | 99% |
+| **mimo-v2.6-flash** | $0.14 | $0.0028 | 98% |
+| **mimo-v2.6-pro** | $0.435 | $0.0036 | 99% |
+
+Xiaomi Token Plans bill the same ratio in credits: 2 against 100 per token
+for flash, and 2.5 against 300 for pro. The extension shows raw credits saved
+on `xiaomi-token-plan-*` providers.
 
 ## Installation
 
@@ -57,12 +65,12 @@ stats are available via /cache-stats and /cache-graph commands.
 
 ## Provider Support
 
-Works with any provider serving DeepSeek models:
-- **Any provider** with `deepseek-*` model IDs (NaN Builders, custom proxies, etc.)
-- **DeepSeek API** (`deepseek` provider) — direct API users
-- **OpenRouter** — see caveat below
+Works with any provider serving a registered model family:
+- **DeepSeek** — `deepseek-*` model IDs on any provider, plus the `deepseek` provider.
+- **Xiaomi MiMo** — `mimo-*` model IDs on any provider, plus the `xiaomi` and `xiaomi-token-plan-{ams,cn,sgp}` providers.
+- **OpenRouter** — DeepSeek and MiMo slugs, with the pinning caveat below.
 
-Non-DeepSeek models pass through unchanged.
+Unregistered models pass through unchanged.
 
 ### OpenRouter caveat
 
@@ -77,10 +85,12 @@ extension leaves them untouched.
 
 ## Subagent Compatibility
 
-This extension automatically applies to subagent processes that use DeepSeek
-models. It declares `appliesToModels: ["deepseek-*", "deepseek"]` in its
+This extension automatically applies to subagent processes that use a
+supported model family. It declares an `appliesToModels` list in its
 `package.json`, which the [pi-subagents](https://github.com/rohaquinlop/pi-subagents)
 extension detects and loads into child processes — no configuration needed.
+The list covers `deepseek-*`, `mimo-*`, the nested OpenRouter forms
+(`*/deepseek-*`, `*/mimo-*`), and the exact xiaomi provider names.
 
 For the best cache performance, ensure both extensions are installed:
 
@@ -92,7 +102,7 @@ pi install npm:@rohaquinlop/pi-deepseek-cache
 ## Commands
 
 ### `/cache-stats`
-Overlay popup showing two sections: **this session's** stats and an **aggregate across all sessions** (N sessions). Each section shows hit rate, cache read/write/input tokens, turns, and estimated cost savings.
+Overlay popup showing two sections: **this session's** stats and an **aggregate across all sessions** (N sessions). Each section shows hit rate, cache read/write/input tokens, turns, and estimated cost savings. Savings show in USD, or in plan credits on `xiaomi-token-plan-*` providers. Mixed families across sessions show both units.
 
 ### `/cache-graph`
 ASCII trend chart of hit rate over turns — helps spot regressions.
@@ -108,7 +118,7 @@ Clears all cached statistics, history, and summary cache — deletes all per-ses
 
 **P2 (Prefix guard):** On `before_provider_request`, SHA-256 hashes all messages except the last to fingerprint the prefix. Tracks when the hash changes — the break count is visible in `/cache-stats`.
 
-**P3 (Compaction):** On `session_before_compact`, summarizes conversation history with deepseek-v4-flash at temperature 0. Summaries are SHA-256 hashed and cached — identical histories produce byte-identical summaries, keeping compaction cache-stable.
+**P3 (Compaction):** On `session_before_compact`, summarizes conversation history with the active family's cheap summarizer — `deepseek-v4-flash`, or `mimo-v2.6-flash` then `mimo-v2.5` — at temperature 0. Both the history and the summarizer model ID feed the cache key, and summaries are SHA-256 cached for stable replays.
 
 **P4 (Overlays):** `/cache-stats` and `/cache-graph` render as TUI overlay popups (Esc to dismiss) with formatted hit-rate data and ASCII trend charts.
 
