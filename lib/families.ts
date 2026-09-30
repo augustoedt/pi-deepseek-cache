@@ -101,7 +101,7 @@ export const CACHE_FAMILIES: CacheFamily[] = [
       "deepseek-v4-flash": DEEPSEEK_FLASH,
       "deepseek-v4-pro": DEEPSEEK_PRO,
     },
-    summarizerModels: ["deepseek-v4-flash"],
+    summarizerModels: ["deepseek-flash", "deepseek-v4-flash"],
     openRouterVendor: "deepseek",
   },
   {

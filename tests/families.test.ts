@@ -236,6 +236,7 @@ describe("resolveSummarizerCandidates", () => {
 
   it("returns the DeepSeek preference list", () => {
     expect(resolveSummarizerCandidates({ id: "deepseek-v4-pro", provider: "nan" })).toEqual([
+      "deepseek-flash",
       "deepseek-v4-flash",
     ]);
   });

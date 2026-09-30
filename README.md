@@ -27,7 +27,7 @@ Pi's default system prompt embeds `Current date: YYYY-MM-DD` and `Current workin
 | **P0** | Date & CWD freeze | Root-cause fix — locks session date and directory, preventing daily/per-session cache bust |
 | **P1** | Hit-rate telemetry | Per-session hit rate shown as dimmed footer status line; /cache-stats & /cache-graph for detail |
 | **P2** | Prefix guard | SHA-256 hash diagnostics — tracks prefix breaks (viewable in /cache-stats) |
-| **P3** | Cache-friendly compaction | Deterministic summarization via deepseek-v4-flash at temperature 0, SHA-256 cached for stable replays |
+| **P3** | Cache-friendly compaction | Deterministic summarization via `deepseek-flash` at temperature 0, with `deepseek-v4-flash` as a legacy fallback, SHA-256 cached for stable replays |
 | **P4** | TUI overlays | `/cache-stats` popup with hit rate, tokens, cost savings. `/cache-graph` ASCII trend chart |
 | **P5** | OpenRouter auto-pin | Pins every request to one cache-capable upstream so OpenRouter's load balancer can't bust the cache |
 
@@ -48,14 +48,10 @@ on `xiaomi-token-plan-*` providers.
 
 ## Installation
 
-```bash
-pi install npm:@rohaquinlop/pi-deepseek-cache
-```
-
-Or via git:
+Install this fork from GitHub:
 
 ```bash
-pi install git:github.com/rohaquinlop/pi-deepseek-cache
+pi install git:github.com/augustoedt/pi-deepseek-cache
 ```
 
 The extension activates automatically. No configuration needed. The per-session
@@ -96,7 +92,7 @@ For the best cache performance, ensure both extensions are installed:
 
 ```bash
 pi install npm:@rohaquinlop/pi-subagents
-pi install npm:@rohaquinlop/pi-deepseek-cache
+pi install git:github.com/augustoedt/pi-deepseek-cache
 ```
 
 ## Commands
@@ -118,7 +114,7 @@ Clears all cached statistics, history, and summary cache — deletes all per-ses
 
 **P2 (Prefix guard):** On `before_provider_request`, SHA-256 hashes all messages except the last to fingerprint the prefix. Tracks when the hash changes — the break count is visible in `/cache-stats`.
 
-**P3 (Compaction):** On `session_before_compact`, summarizes conversation history with the active family's cheap summarizer — `deepseek-v4-flash`, or `mimo-v2.6-flash` then `mimo-v2.5` — at temperature 0. Both the history and the summarizer model ID feed the cache key, and summaries are SHA-256 cached for stable replays.
+**P3 (Compaction):** On `session_before_compact`, summarizes conversation history with the active family's cheap summarizer — `deepseek-flash` with `deepseek-v4-flash` as a legacy fallback, or `mimo-v2.6-flash` then `mimo-v2.5` — at temperature 0. Both the history and the summarizer model ID feed the cache key, and summaries are SHA-256 cached for stable replays.
 
 **P4 (Overlays):** `/cache-stats` and `/cache-graph` render as TUI overlay popups (Esc to dismiss) with formatted hit-rate data and ASCII trend charts.
 
